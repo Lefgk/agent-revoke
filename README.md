@@ -95,3 +95,7 @@ cd web && npm install && npm run dev
 
 ## Regenerate ABIs
 `forge build && node tools/gen-abi.mjs` writes `web/src/abi.ts`.
+
+## Contact
+
+Support and questions: [lg.playstudio@gmail.com](mailto:lg.playstudio@gmail.com)
