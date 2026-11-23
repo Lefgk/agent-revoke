@@ -25,6 +25,8 @@ See [SPEC.md](SPEC.md) for the problem, competitors and choices, and [DEPLOY.md]
 ERC-20 `approve(0)`, Permit2 `lockdown` and SpendPermission `revoke` all require `msg.sender` to be the owner. PanicRevoke cannot do that as a third party. So:
 
 - `panic()` / `panicWith()` must run *as the owner* — designate this contract via EIP-7702 and call the EOA, or `delegatecall` from the account.
+- On an EIP-7702 EOA, `panicWith()` (caller-supplied targets) only accepts a self-call from the EOA; `panic()` (registered targets) may be triggered by anyone, like `panicAsModule`.
+- Panics are best-effort: a target that fails (paused token, already-disabled module) is skipped and logged as `RevokeFailed(account, kind, target, index)`; the dapp should check for these events.
 - `panicAsModule(safe)` works when PanicRevoke is an enabled Safe module.
 - Otherwise the dapp sends sequential owner transactions (or you batch them in a Safe MultiSend / EIP-5792 `wallet_sendCalls`).
 - EIP-7702 itself cannot be cleared here (needs a type-4 authorization to `address(0)`). The UI shows the delegate and links out.

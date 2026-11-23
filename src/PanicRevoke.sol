@@ -59,7 +59,10 @@ contract PanicRevoke {
     mapping(address => mapping(bytes32 => uint256)) internal _spendIndex;
     mapping(address => mapping(address => uint256)) internal _moduleIndex;
 
-    uint256 private _locked;
+    /// @dev Transient-storage slot for the reentrancy lock. Transient storage is used so
+    ///      that `panic()` running in an account's context (EIP-7702 or delegatecall) never
+    ///      reads or writes that account's persistent storage. keccak256("PanicRevoke.lock") - 1
+    bytes32 private constant _LOCK_SLOT = 0x46848f0fbb7419c3ea5aa2ca5cb6a2ade160fb8571d0481377fe04209fc1905a;
 
     event Erc20Registered(address indexed owner, address token, address spender);
     event Erc20Unregistered(address indexed owner, address token, address spender);
@@ -69,6 +72,10 @@ contract PanicRevoke {
     event SpendPermissionUnregistered(address indexed owner, bytes32 indexed hashKey);
     event SafeModuleRegistered(address indexed owner, address module);
     event SafeModuleUnregistered(address indexed owner, address module);
+    /// @notice A single revoke inside a panic failed and was skipped (best-effort panic).
+    ///         kind: 0 = ERC-20 approve, 1 = Permit2 lockdown, 2 = SpendPermission revoke,
+    ///         3 = Safe module disable.
+    event RevokeFailed(address indexed account, uint8 indexed kind, address target, uint256 index);
     event PanicExecuted(
         address indexed account, uint256 erc20Count, uint256 permit2Count, uint256 spendCount, uint256 moduleCount
     );
@@ -82,12 +89,22 @@ contract PanicRevoke {
     error NotSafeModule();
     error ModuleCallFailed(address to);
     error Reentrancy();
+    error NotAuthorized();
 
     modifier nonReentrant() {
-        if (_locked == 1) revert Reentrancy();
-        _locked = 1;
+        bytes32 slot = _LOCK_SLOT;
+        uint256 locked;
+        assembly {
+            locked := tload(slot)
+        }
+        if (locked != 0) revert Reentrancy();
+        assembly {
+            tstore(slot, 1)
+        }
         _;
-        _locked = 0;
+        assembly {
+            tstore(slot, 0)
+        }
     }
 
     constructor() {
@@ -254,6 +271,7 @@ contract PanicRevoke {
     }
 
     /// @notice Same as `panic()` but uses caller-supplied targets (no registry read).
+    ///         On an EIP-7702 EOA only the EOA itself (self-call) may use it.
     function panicWith(
         TokenSpender[] calldata erc20,
         TokenSpender[] calldata permit2Pairs,
@@ -261,6 +279,10 @@ contract PanicRevoke {
     ) external nonReentrant {
         address account = address(this);
         if (account == registry) revert NotAccountContext();
+        // Caller-supplied targets: on an EIP-7702 EOA anyone can call this code, so only
+        // the EOA itself may pass arbitrary targets. Under delegatecall the calling account
+        // contract already authorised the call.
+        if (_is7702Delegated(account) && msg.sender != account) revert NotAuthorized();
         Targets memory t;
         t.erc20 = erc20;
         t.permit2 = permit2Pairs;
@@ -284,18 +306,26 @@ contract PanicRevoke {
     function _executeAsAccount(address account, Targets memory t) internal {
         uint256 i;
         for (i = 0; i < t.erc20.length; i++) {
-            IERC20(t.erc20[i].token).approve(t.erc20[i].spender, 0);
+            if (!_approveZero(t.erc20[i].token, t.erc20[i].spender)) {
+                emit RevokeFailed(account, 0, t.erc20[i].token, i);
+            }
         }
         if (t.permit2.length != 0) {
             IPermit2.TokenSpenderPair[] memory pairs = new IPermit2.TokenSpenderPair[](t.permit2.length);
             for (i = 0; i < t.permit2.length; i++) {
                 pairs[i] = IPermit2.TokenSpenderPair({token: t.permit2[i].token, spender: t.permit2[i].spender});
             }
-            IPermit2(PERMIT2).lockdown(pairs);
+            try IPermit2(PERMIT2).lockdown(pairs) {}
+            catch {
+                emit RevokeFailed(account, 1, PERMIT2, 0);
+            }
         }
         for (i = 0; i < t.spendPermissions.length; i++) {
             if (t.spendPermissions[i].account != account) revert SpendAccountMismatch();
-            ISpendPermissionManager(SPEND_PERMISSION_MANAGER).revoke(t.spendPermissions[i]);
+            try ISpendPermissionManager(SPEND_PERMISSION_MANAGER).revoke(t.spendPermissions[i]) {}
+            catch {
+                emit RevokeFailed(account, 2, SPEND_PERMISSION_MANAGER, i);
+            }
         }
         emit PanicExecuted(account, t.erc20.length, t.permit2.length, t.spendPermissions.length, 0);
     }
@@ -303,54 +333,81 @@ contract PanicRevoke {
     function _executeAsModule(address safe, Targets memory t) internal {
         uint256 i;
         for (i = 0; i < t.erc20.length; i++) {
-            _moduleCall(
-                safe,
-                t.erc20[i].token,
-                abi.encodeWithSelector(IERC20.approve.selector, t.erc20[i].spender, uint256(0))
-            );
+            if (
+                !_moduleCall(
+                    safe,
+                    t.erc20[i].token,
+                    abi.encodeWithSelector(IERC20.approve.selector, t.erc20[i].spender, uint256(0))
+                )
+            ) emit RevokeFailed(safe, 0, t.erc20[i].token, i);
         }
         if (t.permit2.length != 0) {
             IPermit2.TokenSpenderPair[] memory pairs = new IPermit2.TokenSpenderPair[](t.permit2.length);
             for (i = 0; i < t.permit2.length; i++) {
                 pairs[i] = IPermit2.TokenSpenderPair({token: t.permit2[i].token, spender: t.permit2[i].spender});
             }
-            _moduleCall(safe, PERMIT2, abi.encodeWithSelector(IPermit2.lockdown.selector, pairs));
+            if (!_moduleCall(safe, PERMIT2, abi.encodeWithSelector(IPermit2.lockdown.selector, pairs))) {
+                emit RevokeFailed(safe, 1, PERMIT2, 0);
+            }
         }
         for (i = 0; i < t.spendPermissions.length; i++) {
             if (t.spendPermissions[i].account != safe) revert SpendAccountMismatch();
-            _moduleCall(
-                safe,
-                SPEND_PERMISSION_MANAGER,
-                abi.encodeCall(ISpendPermissionManager.revoke, (t.spendPermissions[i]))
-            );
+            if (
+                !_moduleCall(
+                    safe,
+                    SPEND_PERMISSION_MANAGER,
+                    abi.encodeCall(ISpendPermissionManager.revoke, (t.spendPermissions[i]))
+                )
+            ) emit RevokeFailed(safe, 2, SPEND_PERMISSION_MANAGER, i);
         }
         for (i = 0; i < t.safeModules.length; i++) {
             address module = t.safeModules[i];
             if (module == address(this)) continue; // stay enabled until the Safe opts out
-            address prev = _prevModule(safe, module);
-            _moduleCall(safe, safe, abi.encodeWithSelector(ISafe.disableModule.selector, prev, module));
+            (bool found, address prev) = _prevModule(safe, module);
+            if (!found || !_moduleCall(safe, safe, abi.encodeWithSelector(ISafe.disableModule.selector, prev, module)))
+            {
+                emit RevokeFailed(safe, 3, module, i);
+            }
         }
         emit PanicExecuted(safe, t.erc20.length, t.permit2.length, t.spendPermissions.length, t.safeModules.length);
     }
 
-    function _moduleCall(address safe, address to, bytes memory data) internal {
-        bool ok = ISafe(safe).execTransactionFromModule(to, 0, data, SAFE_CALL);
-        if (!ok) revert ModuleCallFailed(to);
+    function _moduleCall(address safe, address to, bytes memory data) internal returns (bool ok) {
+        try ISafe(safe).execTransactionFromModule(to, 0, data, SAFE_CALL) returns (bool success) {
+            ok = success;
+        } catch {
+            ok = false;
+        }
     }
 
-    function _prevModule(address safe, address module) internal view returns (address prev) {
+    /// @dev ERC-20 `approve(spender, 0)` that accepts tokens returning nothing (USDT) and
+    ///      reports failure instead of reverting.
+    function _approveZero(address token, address spender) internal returns (bool) {
+        if (token.code.length == 0) return false;
+        (bool ok, bytes memory ret) = token.call(abi.encodeWithSelector(IERC20.approve.selector, spender, uint256(0)));
+        return ok && (ret.length == 0 || (ret.length >= 32 && abi.decode(ret, (bool))));
+    }
+
+    /// @dev True when `account` is an EOA whose code is an EIP-7702 delegation designator.
+    function _is7702Delegated(address account) internal view returns (bool) {
+        if (account.code.length != 23) return false;
+        bytes memory c = account.code;
+        return c[0] == 0xef && c[1] == 0x01 && c[2] == 0x00;
+    }
+
+    function _prevModule(address safe, address module) internal view returns (bool found, address prev) {
         address start = SENTINEL_MODULE;
         while (true) {
             (address[] memory page, address next) = ISafe(safe).getModulesPaginated(start, 64);
             prev = start;
             for (uint256 i; i < page.length; i++) {
-                if (page[i] == module) return prev;
+                if (page[i] == module) return (true, prev);
                 prev = page[i];
             }
             if (next == address(0) || next == SENTINEL_MODULE || page.length == 0) break;
             start = next;
         }
-        revert UnknownTarget();
+        return (false, address(0));
     }
 
     function _unregisterPair(
