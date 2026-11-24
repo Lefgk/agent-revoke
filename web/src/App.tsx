@@ -1,20 +1,12 @@
 import { useMemo, useState } from "react";
-import {
-  useAccount,
-  useChainId,
-  useConnect,
-  useDisconnect,
-  usePublicClient,
-  useSwitchChain,
-  useWriteContract,
-} from "wagmi";
+import { useAccount, useChainId, usePublicClient } from "wagmi";
 import { erc20Abi, formatUnits, isAddress, type Address } from "viem";
 import { panicRevokeAbi } from "./abi";
 import { deployments } from "./config";
+import { Addr, Empty, Hint, Loading, Shell, useTx } from "./ui";
 import { CAVEATS, PERMIT2, REVOKE_CASH_7702, SPEND_PERMISSION_MANAGER } from "./constants";
 import { scanOwner, type ScanResult } from "./scan";
 
-const short = (a?: string) => (a ? `${a.slice(0, 6)}…${a.slice(-4)}` : "");
 
 const permit2LockdownAbi = [
   {
@@ -53,14 +45,14 @@ const spendRevokeAbi = [
   },
 ] as const;
 
+/** Raw token amount; the usual "infinite approval" values are shown as Unlimited. */
+const fmtRaw = (v: bigint) => (v >= 1n << 159n ? "Unlimited" : v.toString());
+
 export default function App() {
   const { address, isConnected } = useAccount();
   const chainId = useChainId();
-  const { connect, connectors } = useConnect();
-  const { disconnect } = useDisconnect();
-  const { switchChain, chains } = useSwitchChain();
   const publicClient = usePublicClient();
-  const { writeContractAsync, isPending } = useWriteContract();
+  const { writeContractAsync, status: txStatus, run, busy: isPending } = useTx();
   const dep = deployments[chainId] ?? {};
 
   const [owner, setOwner] = useState("");
@@ -73,9 +65,9 @@ export default function App() {
   const resolvedOwner = (isAddress(owner) ? owner : address) as Address | undefined;
   const resolvedAgent = isAddress(agent) ? (agent as Address) : undefined;
 
-  const onScan = async () => {
+  const onScan = async (keepStatus = false) => {
     setError("");
-    setStatus("");
+    if (!keepStatus) setStatus("");
     if (!publicClient || !resolvedOwner) {
       setError("Paste an owner address or connect a wallet.");
       return;
@@ -95,25 +87,26 @@ export default function App() {
     }
   };
 
-  const tx = async (fn: () => Promise<unknown>, ok: string) => {
+  // Ask the wallet, wait for the receipt, then show a follow-up note and refresh the list.
+  const tx = async (label: string, fn: () => Promise<`0x${string}`>, ok: string, rescan = true) => {
     setError("");
     setStatus("");
-    try {
-      await fn();
+    if (await run(label, fn)) {
       setStatus(ok);
-    } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (rescan) await onScan(true);
     }
   };
 
   const revokeErc20 = (token: Address, spender: Address) =>
     tx(
+      "Revoke ERC-20 approval",
       () => writeContractAsync({ address: token, abi: erc20Abi, functionName: "approve", args: [spender, 0n] }),
-      `Sent approve(0) for ${short(token)} → ${short(spender)}. This had to come from the owner.`,
+      "approve(0) confirmed. It only clears the allowance if the connected wallet is the owner you scanned.",
     );
 
   const lockdownPermit2 = (token: Address, spender: Address) =>
     tx(
+      "Permit2 lockdown",
       () =>
         writeContractAsync({
           address: PERMIT2,
@@ -121,11 +114,12 @@ export default function App() {
           functionName: "lockdown",
           args: [[{ token, spender }]],
         }),
-      "Sent Permit2 lockdown. Already-signed SignatureTransfer permits are not voided.",
+      "Permit2 lockdown confirmed. Already-signed SignatureTransfer permits are not voided.",
     );
 
   const revokeSpend = (p: ScanResult["spendPermissions"][number]) =>
     tx(
+      "Revoke spend permission",
       () =>
         writeContractAsync({
           address: SPEND_PERMISSION_MANAGER,
@@ -143,12 +137,13 @@ export default function App() {
             extraData: p.extraData,
           }],
         }),
-      "Sent SpendPermission.revoke.",
+      "Spend permission revoked.",
     );
 
   const registerErc20 = (token: Address, spender: Address) => {
     if (!dep.panicRevoke) return;
     return tx(
+      "Register ERC-20 target",
       () =>
         writeContractAsync({
           address: dep.panicRevoke!,
@@ -157,12 +152,14 @@ export default function App() {
           args: [token, spender],
         }),
       "Registered ERC-20 target on PanicRevoke.",
+      false,
     );
   };
 
   const registerPermit2 = (token: Address, spender: Address) => {
     if (!dep.panicRevoke) return;
     return tx(
+      "Register Permit2 target",
       () =>
         writeContractAsync({
           address: dep.panicRevoke!,
@@ -171,12 +168,14 @@ export default function App() {
           args: [token, spender],
         }),
       "Registered Permit2 target on PanicRevoke.",
+      false,
     );
   };
 
   const registerSpend = (p: ScanResult["spendPermissions"][number]) => {
     if (!dep.panicRevoke) return;
     return tx(
+      "Register spend permission",
       () =>
         writeContractAsync({
           address: dep.panicRevoke!,
@@ -195,12 +194,14 @@ export default function App() {
           }],
         }),
       "Registered spend permission on PanicRevoke.",
+      false,
     );
   };
 
   const panicAsModule = () => {
     if (!dep.panicRevoke || !resolvedOwner) return;
     return tx(
+      "Panic revoke (Safe module)",
       () =>
         writeContractAsync({
           address: dep.panicRevoke!,
@@ -208,7 +209,7 @@ export default function App() {
           functionName: "panicAsModule",
           args: [resolvedOwner],
         }),
-      "Sent panicAsModule. This only works if PanicRevoke is an enabled Safe module of the owner.",
+      "panicAsModule confirmed: every registered target of this Safe was cleared.",
     );
   };
 
@@ -222,95 +223,113 @@ export default function App() {
     };
   }, [result]);
 
+  const scanningOther = !!resolvedOwner && !!address && resolvedOwner.toLowerCase() !== address.toLowerCase();
+  const canSign = isConnected && !isPending;
+
   return (
-    <div className="wrap">
-      <h1>AgentRevoke</h1>
-      <div className="muted">
-        A Revoke.cash for AI agents: list and revoke ERC-20 approvals, Permit2 allowances, Coinbase Spend
-        Permissions, Safe modules and EIP-7702 status on Ethereum and Base. Prototype — not audited.
-      </div>
-
+    <Shell
+      title="AgentRevoke"
+      tagline="See everything an AI agent (or any spender) is still allowed to take from a wallet, and switch it off. Lists ERC-20 approvals, Permit2 allowances, Coinbase Spend Permissions, Safe modules and EIP-7702 delegation."
+      steps={[
+        "Scan an owner address. Read-only, no wallet needed.",
+        "Revoke single permissions with one owner transaction each.",
+        "Optional: register targets on PanicRevoke to clear them all in one call later.",
+      ]}
+      contractLabel="PanicRevoke"
+      contractOf={(id) => deployments[id]?.panicRevoke}
+      refs={[
+        { label: "Permit2", address: PERMIT2 },
+        { label: "Spend Permission Manager", address: SPEND_PERMISSION_MANAGER },
+      ]}
+      risk={
+        <>
+          <strong>Live network.</strong> PanicRevoke is not audited. Revoking only removes permissions and never moves
+          tokens, but each revoke is a real transaction that costs gas.
+        </>
+      }
+    >
       <div className="card">
-        <h2>Wallet</h2>
-        {!isConnected ? (
-          <div className="row">
-            {connectors.map((c) => (
-              <button key={c.uid} onClick={() => connect({ connector: c })}>
-                Connect {c.name}
-              </button>
-            ))}
-          </div>
-        ) : (
-          <div className="row">
-            <span>
-              Connected <code>{address}</code>
-            </span>
-            <button className="ghost" onClick={() => disconnect()}>
-              Disconnect
-            </button>
-          </div>
-        )}
-        <div className="row">
-          {chains.map((c) => (
-            <button key={c.id} className={c.id === chainId ? "" : "ghost"} onClick={() => switchChain({ chainId: c.id })}>
-              {c.name}
-            </button>
-          ))}
-        </div>
-        {!deployments[chainId] && <div className="warn">Unsupported chain: use Ethereum, Base or local anvil.</div>}
-        {deployments[chainId] && !dep.panicRevoke && (
-          <div className="warn">
-            <strong>PanicRevoke is not deployed yet</strong> on this chain — register / panic stay disabled until
-            you deploy (<code>make deploy-mainnet</code> or <code>make deploy-base</code>). Scanning and
-            individual owner-signed revokes still work.
-          </div>
-        )}
-        {deployments[chainId]?.live && dep.panicRevoke && (
-          <div className="warn">Live chain with real funds. This contract is NOT audited.</div>
-        )}
-      </div>
-
-      <div className="card">
-        <h2>Scan</h2>
+        <h2>1. Scan an address</h2>
         <div className="row">
           <label>
-            Owner address
+            Owner address {address && !owner && "(empty = your connected wallet)"}
             <input
               placeholder={address ?? "0x…"}
               value={owner}
-              onChange={(e) => setOwner(e.target.value)}
+              spellCheck={false}
+              onChange={(e) => setOwner(e.target.value.trim())}
             />
           </label>
           <label>
-            Agent (optional spender filter)
-            <input placeholder="0x…" value={agent} onChange={(e) => setAgent(e.target.value)} />
+            Agent / spender filter (optional)
+            <input placeholder="0x…" value={agent} spellCheck={false} onChange={(e) => setAgent(e.target.value.trim())} />
           </label>
-          <button onClick={onScan} disabled={scanning}>
+          <button onClick={() => onScan()} disabled={scanning}>
             {scanning ? "Scanning…" : "Scan"}
           </button>
         </div>
-        <div className="muted">
-          Logs are fetched in chunks on your RPC, then live allowances are confirmed with Multicall3.
-          Default window is the last 50,000 blocks. Paste an owner even without a connected wallet.
-        </div>
+        {owner && !isAddress(owner) && (
+          <div className="bad muted">Owner is not a valid address (0x followed by 40 hex characters).</div>
+        )}
+        {agent && !isAddress(agent) && <div className="bad muted">Agent filter is not a valid address; it is ignored.</div>}
+        <Hint>
+          Scanning only reads the chain: nothing is signed and no gas is spent. It looks at the last 50,000 blocks of
+          approval events, then confirms each allowance is still live.
+        </Hint>
+        {scanning && <Loading>Reading approval events and live allowances…</Loading>}
       </div>
 
-      {error && <div className="warn bad">{error}</div>}
-      {status && <div className="info ok">{status}</div>}
+      {error && (
+        <div className="tx tx-error" role="alert">
+          <span className="tx-body">
+            <strong>Scan failed</strong> · {error}
+          </span>
+        </div>
+      )}
+      {!result && !scanning && !error && (
+        <Empty>No scan yet. Enter an owner address above (or connect a wallet) and press Scan.</Empty>
+      )}
 
       {result && counts && (
         <>
           <div className="card">
-            <h2>Results</h2>
-            <div className="muted">
-              Blocks {result.fromBlock.toString()}–{result.toBlock.toString()}. Live: {counts.erc20} ERC-20,{" "}
-              {counts.permit2} Permit2, {counts.spend} spend permissions
-              {result.eip7702 ? ", EIP-7702 delegate set" : ""}.
-            </div>
+            <h2>2. Live permissions</h2>
+            <dl className="dl">
+              <dt>Owner scanned</dt>
+              <dd>
+                <Addr value={resolvedOwner} full />
+              </dd>
+              <dt>Blocks</dt>
+              <dd>
+                {result.fromBlock.toString()}–{result.toBlock.toString()}
+              </dd>
+              <dt>Found</dt>
+              <dd>
+                {counts.erc20} ERC-20, {counts.permit2} Permit2, {counts.spend} spend permissions, {counts.modules} Safe
+                modules{result.eip7702 ? ", EIP-7702 delegate set" : ""}
+              </dd>
+            </dl>
+            {!isConnected && (
+              <div className="info">Read-only view. Connect the owner wallet to revoke or register anything.</div>
+            )}
+            {isConnected && scanningOther && (
+              <div className="warn">
+                <strong>Connected wallet is not the scanned owner.</strong> Revoke, Lockdown and Register act on the
+                connected wallet's own permissions, so they will not change this owner's list. Connect the owner
+                wallet to revoke.
+              </div>
+            )}
+            <Hint>
+              <strong>Revoke / Lockdown</strong> sends one transaction from your wallet that sets that single
+              permission to zero. <strong>Register</strong> moves nothing: it saves the target on PanicRevoke so a
+              later panic call can clear it.
+            </Hint>
+            {txStatus}
+            {status && <div className="info ok">{status}</div>}
 
-            <h2 style={{ marginTop: 16 }}>ERC-20 approvals</h2>
+            <h3>ERC-20 approvals</h3>
             {result.erc20.length === 0 ? (
-              <div className="muted">None live in this window.</div>
+              <Empty>None live in this window.</Empty>
             ) : (
               <table>
                 <thead>
@@ -324,14 +343,14 @@ export default function App() {
                 <tbody>
                   {result.erc20.map((r) => (
                     <tr key={`${r.token}-${r.spender}`}>
-                      <td><code>{short(r.token)}</code></td>
-                      <td><code>{short(r.spender)}</code></td>
-                      <td>{r.allowance.toString()}</td>
+                      <td><Addr value={r.token} /></td>
+                      <td><Addr value={r.spender} /></td>
+                      <td>{fmtRaw(r.allowance)}</td>
                       <td>
-                        <button className="danger" disabled={!isConnected || isPending} onClick={() => revokeErc20(r.token, r.spender)}>
+                        <button className="danger" disabled={!canSign} onClick={() => revokeErc20(r.token, r.spender)}>
                           Revoke
                         </button>{" "}
-                        <button className="ghost" disabled={!dep.panicRevoke || !isConnected || isPending} onClick={() => registerErc20(r.token, r.spender)}>
+                        <button className="ghost" disabled={!dep.panicRevoke || !canSign} onClick={() => registerErc20(r.token, r.spender)}>
                           Register
                         </button>
                       </td>
@@ -341,9 +360,9 @@ export default function App() {
               </table>
             )}
 
-            <h2 style={{ marginTop: 16 }}>Permit2 allowances</h2>
+            <h3>Permit2 allowances</h3>
             {result.permit2.length === 0 ? (
-              <div className="muted">None live in this window.</div>
+              <Empty>None live in this window.</Empty>
             ) : (
               <table>
                 <thead>
@@ -358,15 +377,15 @@ export default function App() {
                 <tbody>
                   {result.permit2.map((r) => (
                     <tr key={`${r.token}-${r.spender}`}>
-                      <td><code>{short(r.token)}</code></td>
-                      <td><code>{short(r.spender)}</code></td>
-                      <td>{r.amount.toString()}</td>
-                      <td>{r.expiration ? new Date(r.expiration * 1000).toISOString() : "—"}</td>
+                      <td><Addr value={r.token} /></td>
+                      <td><Addr value={r.spender} /></td>
+                      <td>{fmtRaw(r.amount)}</td>
+                      <td>{r.expiration ? new Date(r.expiration * 1000).toISOString().slice(0, 16).replace("T", " ") + " UTC" : "—"}</td>
                       <td>
-                        <button className="danger" disabled={!isConnected || isPending} onClick={() => lockdownPermit2(r.token, r.spender)}>
+                        <button className="danger" disabled={!canSign} onClick={() => lockdownPermit2(r.token, r.spender)}>
                           Lockdown
                         </button>{" "}
-                        <button className="ghost" disabled={!dep.panicRevoke || !isConnected || isPending} onClick={() => registerPermit2(r.token, r.spender)}>
+                        <button className="ghost" disabled={!dep.panicRevoke || !canSign} onClick={() => registerPermit2(r.token, r.spender)}>
                           Register
                         </button>
                       </td>
@@ -376,9 +395,9 @@ export default function App() {
               </table>
             )}
 
-            <h2 style={{ marginTop: 16 }}>Coinbase Spend Permissions</h2>
+            <h3>Coinbase Spend Permissions</h3>
             {result.spendPermissions.length === 0 ? (
-              <div className="muted">None approved in this window.</div>
+              <Empty>None approved in this window.</Empty>
             ) : (
               <table>
                 <thead>
@@ -392,17 +411,17 @@ export default function App() {
                 <tbody>
                   {result.spendPermissions.map((p) => (
                     <tr key={p.hash}>
-                      <td><code>{short(p.spender)}</code></td>
-                      <td><code>{short(p.token)}</code></td>
+                      <td><Addr value={p.spender} /></td>
+                      <td><Addr value={p.token} /></td>
                       <td>
-                        {p.allowance.toString()} / {p.period}s
+                        {fmtRaw(p.allowance)} / {p.period}s
                         <div className="muted">{p.approved ? "approved" : "unknown"}{p.revoked ? " · revoked" : ""}</div>
                       </td>
                       <td>
-                        <button className="danger" disabled={!isConnected || isPending} onClick={() => revokeSpend(p)}>
+                        <button className="danger" disabled={!canSign} onClick={() => revokeSpend(p)}>
                           Revoke
                         </button>{" "}
-                        <button className="ghost" disabled={!dep.panicRevoke || !isConnected || isPending} onClick={() => registerSpend(p)}>
+                        <button className="ghost" disabled={!dep.panicRevoke || !canSign} onClick={() => registerSpend(p)}>
                           Register
                         </button>
                       </td>
@@ -412,28 +431,28 @@ export default function App() {
               </table>
             )}
 
-            <h2 style={{ marginTop: 16 }}>EIP-7702</h2>
+            <h3>EIP-7702</h3>
             {result.eip7702 ? (
               <div className="warn">
-                Delegate: <code>{result.eip7702.delegate}</code>. This dapp cannot revoke it. Your wallet must send
+                Delegate: <Addr value={result.eip7702.delegate} full />. This dapp cannot revoke it. Your wallet must send
                 a type-4 authorization to <code>address(0)</code>.{" "}
-                <a href={REVOKE_CASH_7702} target="_blank" rel="noreferrer" style={{ color: "#8cb4ff" }}>
+                <a href={REVOKE_CASH_7702} target="_blank" rel="noopener noreferrer">
                   Learn how (Revoke.cash)
                 </a>
               </div>
             ) : (
-              <div className="muted">No EIP-7702 designation on this address.</div>
+              <Empty>No EIP-7702 designation on this address.</Empty>
             )}
 
-            <h2 style={{ marginTop: 16 }}>Safe modules</h2>
+            <h3>Safe modules</h3>
             {result.safeModules == null ? (
-              <div className="muted">This address does not look like a Safe (no getThreshold).</div>
+              <Empty>This address is not a Safe, so it has no modules.</Empty>
             ) : result.safeModules.length === 0 ? (
-              <div className="muted">Safe detected, no modules on the first pages.</div>
+              <Empty>Safe detected, no modules enabled.</Empty>
             ) : (
-              <ul>
+              <ul className="caveats">
                 {result.safeModules.map((m) => (
-                  <li key={m}><code>{m}</code></li>
+                  <li key={m}><Addr value={m} full /></li>
                 ))}
               </ul>
             )}
@@ -444,7 +463,7 @@ export default function App() {
           </div>
 
           <div className="card">
-            <h2>Panic Revoke</h2>
+            <h2>3. Panic revoke (clear everything registered)</h2>
             <p className="muted">
               Register the targets you care about, then clear them in one <code>panic()</code> call <em>only
               when that call runs as the owner</em> (EIP-7702 designation to PanicRevoke, or a delegatecall
@@ -453,10 +472,16 @@ export default function App() {
               transactions, which is the honest path for a plain EOA.
             </p>
             <div className="row">
-              <button className="danger" disabled={!dep.panicRevoke || !isConnected || isPending} onClick={panicAsModule}>
-                panicAsModule (Safe only)
+              <button className="danger" disabled={!dep.panicRevoke || !canSign} onClick={panicAsModule}>
+                Panic revoke as Safe module
               </button>
             </div>
+            <Hint tone="danger">
+              One transaction that zeroes every target registered for the scanned owner. It only succeeds when the
+              owner is a Safe with PanicRevoke enabled as a module; otherwise the call reverts and nothing
+              changes. It removes permissions only and never transfers tokens.
+            </Hint>
+            {!dep.panicRevoke && <div className="muted">Disabled: PanicRevoke is not deployed on this network.</div>}
             <div className="muted">
               There is no in-app button that pretends a plain EOA can batch-clear ERC-20 approvals in one
               contract call. If your wallet supports EIP-7702 or EIP-5792 <code>wallet_sendCalls</code>, you
@@ -467,7 +492,7 @@ export default function App() {
       )}
 
       <div className="card">
-        <h2>What cannot be batch-cleared</h2>
+        <h2>Limits to know about</h2>
         <ul className="caveats">
           {CAVEATS.map((c) => (
             <li key={c}>{c}</li>
@@ -477,6 +502,6 @@ export default function App() {
           Amounts are raw on-chain values (USDC has 6 decimals: 1 USDC = {formatUnits(1_000000n, 6)}).
         </div>
       </div>
-    </div>
+    </Shell>
   );
 }
